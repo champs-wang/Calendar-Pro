@@ -1,0 +1,1033 @@
+import { ItemView, Notice, Platform, TFile, WorkspaceLeaf } from "obsidian";
+import { t } from "../../i18n";
+import DiaryObsidian from "../../main";
+import {
+	TODO_CHIP_EMOJI_COMPLETED,
+	TODO_CHIP_EMOJI_INCOMPLETE,
+	VIEW_TYPE_MONTHLY_PLANNER,
+} from "../../constants";
+import type { ChipDragState } from "../yearly-planner/types";
+import type {
+	MonthlyPlannerSelectedDate,
+	MonthlyPlannerState,
+} from "./types";
+import {
+	getChipColor,
+	getFileTitle,
+	getFilesForDate,
+	isRecurrenceOccurrenceFile,
+	isRecurrenceSourceFile,
+	isTodoCompleted,
+	isTodoFile,
+	getRangeLaneMap,
+	getRangesForYear,
+	getPlannerMarkdownFiles,
+	getMonthNoteFilePath,
+} from "../yearly-planner/file-utils";
+import {
+	renderPlanNotePanel,
+	syncPlanNotePanelExpandedState,
+} from "../plan-note-panel";
+import {
+	renderMonthlyPlannerHeader,
+	createMonthlyCell,
+	getMonthLabel,
+	getWeekdayLabels,
+} from "./render";
+import {
+	openDateNote as openDateNoteOp,
+	createRangeFile as createRangeFileOp,
+	createSingleDateFile as createSingleDateFileOp,
+} from "../yearly-planner/file-operations";
+import {
+	MonthlyInteractionHandler,
+	type MonthlyPlannerViewDelegate,
+} from "./interactions";
+import { CreateFileModal, FileOptionsModal } from "../yearly-planner/modals";
+import { getSelectionBounds } from "../yearly-planner/selection";
+import { getHolidaysForYear } from "../../utils/holidays";
+import { getDaysInMonth, getMonthCalendarCells } from "../../utils/date";
+import { getAlternateCalendarLabel } from "../../utils/alternate-calendars";
+import {
+	materializeRecurrencesForRange,
+	type RecurrenceMaterializeRange,
+} from "../../utils/recurrence";
+import { PinchZoomController } from "./pinch-zoom";
+import {
+	copyPlannerSelectionToClipboard,
+	isPrimaryMod,
+	openPlannerClipboardSelectionTrashModal,
+	PLANNER_CLIPBOARD_BUSY_CLASS,
+	PLANNER_CLIPBOARD_ERROR_NOTICE_MS,
+	PLANNER_CLIPBOARD_SUCCESS_NOTICE_MS,
+	pastePlannerClipboard,
+	resolveClipboardSelectionToFiles,
+	shouldDeferPlannerClipboardToNative,
+	undoPlannerPasteBatch,
+} from "../planner-clipboard";
+
+export type { MonthlyPlannerState } from "./types";
+
+const MONTHLY_PLANNER_COMPACT_LAYOUT_MAX_WIDTH = 560;
+
+export class MonthlyPlannerView
+	extends ItemView
+	implements MonthlyPlannerViewDelegate
+{
+	year: number;
+	month: number;
+	dragState: import("../yearly-planner/types").DragState | null = null;
+	chipDragState: ChipDragState | null = null;
+	clipboardSelection = new Set<string>();
+	private interactionHandler: MonthlyInteractionHandler;
+	private pinchZoom: PinchZoomController | null = null;
+	private pinchZoomScale = 1;
+	private compactLayout = Platform.isMobile;
+	private resizeObserver: ResizeObserver | null = null;
+	private materializeInFlightKey: string | null = null;
+	private selectedDate: MonthlyPlannerSelectedDate | null = null;
+	private daySummaryOpen = false;
+	private clipboardKeydownRegistered = false;
+	private pasteUndoBatches: string[][] = [];
+	private boundClipboardKeydown = (e: KeyboardEvent) => {
+		this.handleClipboardKeydown(e);
+	};
+
+	constructor(
+		leaf: WorkspaceLeaf,
+		public plugin: DiaryObsidian,
+	) {
+		super(leaf);
+		const now = new Date();
+		this.year = now.getFullYear();
+		this.month = now.getMonth() + 1;
+		this.navigation = false;
+		this.interactionHandler = new MonthlyInteractionHandler(this);
+	}
+
+	getViewType(): string {
+		return VIEW_TYPE_MONTHLY_PLANNER;
+	}
+
+	getDisplayText(): string {
+		const locale = this.plugin.settings.locale ?? "en";
+		const monthLabel = getMonthLabel(locale, this.month);
+		return t("view.monthlyDisplayText", {
+			year: this.year,
+			month: monthLabel,
+		});
+	}
+
+	getIcon(): string {
+		return "calendar-days";
+	}
+
+	getState(): MonthlyPlannerState {
+		return {
+			year: this.year,
+			month: this.month,
+			selectedDate: this.selectedDate,
+			daySummaryOpen: this.daySummaryOpen,
+		};
+	}
+
+	async setState(
+		state: MonthlyPlannerState,
+		result: { history: boolean },
+	): Promise<void> {
+		if (state?.year && state?.month) {
+			this.year = state.year;
+			this.month = state.month;
+			const selectedDate = state.selectedDate;
+			if (
+				selectedDate &&
+				selectedDate.year === this.year &&
+				selectedDate.month === this.month
+			) {
+				this.selectedDate = selectedDate;
+			} else {
+				this.selectedDate = null;
+			}
+			this.daySummaryOpen = Boolean(
+				state.daySummaryOpen &&
+					this.selectedDate &&
+					this.shouldUseCompactLayout(),
+			);
+			this.render();
+		}
+		await super.setState(state, result);
+	}
+
+	onOpen(): Promise<void> {
+		if (!this.clipboardKeydownRegistered) {
+			this.registerDomEvent(window, "keydown", this.boundClipboardKeydown, {
+				capture: true,
+			});
+			this.clipboardKeydownRegistered = true;
+		}
+		this.attachResizeObserver();
+		this.render();
+		return Promise.resolve();
+	}
+
+	onClose(): Promise<void> {
+		this.interactionHandler.clearDragListeners();
+		this.pinchZoom?.detach();
+		this.pinchZoom = null;
+		this.resizeObserver?.disconnect();
+		this.resizeObserver = null;
+		this.clipboardSelection.clear();
+		this.pasteUndoBatches.length = 0;
+		return Promise.resolve();
+	}
+
+	isCompactLayout(): boolean {
+		return this.compactLayout;
+	}
+
+	isRangeBarInteractionEnabled(): boolean {
+		return true;
+	}
+
+	/** Update chip-drag state without full render: add chip-dragging class and drop-target. */
+	updateChipDragDropTarget(): void {
+		if (this.chipDragState) {
+			this.contentEl.addClass("monthly-planner-chip-dragging");
+			const { currentYear, currentMonth, currentDay } = this.chipDragState;
+			const cells = this.contentEl.querySelectorAll(
+				"td[data-year][data-month][data-day]:not(.monthly-planner-cell-invalid)",
+			);
+			for (const cell of Array.from(cells)) {
+				const y = parseInt(cell.getAttribute("data-year") ?? "", 10);
+				const m = parseInt(cell.getAttribute("data-month") ?? "", 10);
+				const d = parseInt(cell.getAttribute("data-day") ?? "", 10);
+				(cell as HTMLElement).toggleClass(
+					"monthly-planner-cell-drop-target",
+					y === currentYear && m === currentMonth && d === currentDay,
+				);
+			}
+		} else {
+			this.contentEl.removeClass("monthly-planner-chip-dragging");
+			this.contentEl
+				.querySelectorAll(".monthly-planner-cell-drop-target")
+				.forEach((el) =>
+					(el as HTMLElement).removeClass("monthly-planner-cell-drop-target"),
+				);
+		}
+	}
+
+	render(): void {
+		const { contentEl } = this;
+		this.compactLayout = this.shouldUseCompactLayout();
+		if (!this.compactLayout) {
+			this.daySummaryOpen = false;
+		}
+		const scrollEl = contentEl.querySelector<HTMLElement>(
+			".monthly-planner-scroll",
+		);
+		const scrollTop = scrollEl?.scrollTop ?? 0;
+		const scrollLeft = scrollEl?.scrollLeft ?? 0;
+
+		this.pinchZoomScale = this.pinchZoom?.getScale() ?? this.pinchZoomScale;
+		this.pinchZoom?.detach();
+		this.pinchZoom = null;
+
+		const planNoteWrapper = contentEl.querySelector<HTMLElement>(
+			".plan-note-panel-wrapper",
+		);
+		const preservePlanNote =
+			planNoteWrapper &&
+			planNoteWrapper.hasChildNodes() &&
+			planNoteWrapper.dataset.year === String(this.year) &&
+			planNoteWrapper.dataset.month === String(this.month);
+		if (preservePlanNote) planNoteWrapper.remove();
+
+		contentEl.empty();
+			contentEl.addClass("monthly-planner-container");
+			contentEl.toggleClass("planner-container-compact", this.compactLayout);
+			contentEl.toggleClass(
+				"monthly-planner-container-compact",
+				this.compactLayout,
+		);
+		if (this.chipDragState) {
+			contentEl.addClass("monthly-planner-chip-dragging");
+		} else {
+			contentEl.removeClass("monthly-planner-chip-dragging");
+		}
+
+		const pad = this.plugin.settings.mobileBottomPadding ?? 3.5;
+		contentEl.style.setProperty(
+			"--monthly-planner-mobile-bottom-padding",
+			`${pad}rem`,
+		);
+
+		if (
+			this.selectedDate &&
+			(this.selectedDate.year !== this.year ||
+				this.selectedDate.month !== this.month)
+		) {
+			this.selectedDate = null;
+			this.daySummaryOpen = false;
+		}
+
+		this.renderHeader(contentEl);
+		if (preservePlanNote && planNoteWrapper) {
+			contentEl.appendChild(planNoteWrapper);
+			syncPlanNotePanelExpandedState(
+				planNoteWrapper,
+				this.plugin.isPlanNotePanelExpanded(),
+			);
+		} else {
+			const notePanelEl = contentEl.createDiv({
+				cls: "plan-note-panel-wrapper",
+			});
+			notePanelEl.dataset.year = String(this.year);
+			notePanelEl.dataset.month = String(this.month);
+			void this.renderMonthNotePanel(notePanelEl);
+		}
+		this.renderTable(contentEl);
+
+		const newScrollEl = contentEl.querySelector<HTMLElement>(
+			".monthly-planner-scroll",
+		);
+		if (this.compactLayout && newScrollEl) {
+			this.renderMobileDaySummary(newScrollEl);
+		}
+		if (newScrollEl) {
+			newScrollEl.scrollTop = scrollTop;
+			newScrollEl.scrollLeft = scrollLeft;
+			window.requestAnimationFrame(() => {
+				window.requestAnimationFrame(() => {
+					newScrollEl.scrollTop = scrollTop;
+					newScrollEl.scrollLeft = scrollLeft;
+				});
+			});
+		}
+
+		if (Platform.isMobile) {
+			const zoomWrapper = contentEl.querySelector<HTMLElement>(
+				".monthly-planner-zoom-wrapper",
+			);
+			const zoomInner = contentEl.querySelector<HTMLElement>(
+				".monthly-planner-zoom-inner",
+			);
+			if (zoomWrapper && zoomInner) {
+				this.pinchZoom = new PinchZoomController({
+					scrollContainer: newScrollEl as HTMLElement,
+					zoomWrapper,
+					zoomInner,
+					initialScale: this.pinchZoomScale,
+					onScaleChange: (s) => {
+						this.pinchZoomScale = s;
+					},
+				});
+				this.pinchZoom.attach();
+				window.requestAnimationFrame(() => this.pinchZoom?.refresh());
+			}
+		}
+	}
+
+	private async renderMonthNotePanel(container: HTMLElement): Promise<void> {
+		const folder = this.plugin.settings.plannerFolder || "Planner";
+		const filePath = getMonthNoteFilePath(folder, this.year, this.month);
+		const locale = this.plugin.settings.locale ?? "en";
+		const monthLabel = getMonthLabel(locale, this.month);
+		const label = `${monthLabel} ${this.year}`;
+		await renderPlanNotePanel(container, this.app, filePath, this, {
+			label,
+			expanded: this.plugin.isPlanNotePanelExpanded(),
+			onToggle: () => void this.plugin.togglePlanNotePanelExpanded(),
+			onCreate: async () => {
+				const dir = filePath.split("/").slice(0, -1).join("/");
+				if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
+					await this.app.vault.createFolder(dir);
+				}
+				const newFile = await this.app.vault.create(
+					filePath,
+					`# ${label}\n\n`,
+				);
+				await this.plugin.openPlannerFile(this.leaf, newFile);
+				this.render();
+			},
+			onOpen: (file) => {
+				void this.plugin.openPlannerFile(this.leaf, file);
+			},
+		});
+	}
+
+	private queueMaterializeVisibleRecurrences(
+		range: RecurrenceMaterializeRange,
+		plannerFiles: TFile[],
+	): void {
+		const key = `${range.start}|${range.end}`;
+		if (this.materializeInFlightKey === key) return;
+		this.materializeInFlightKey = key;
+		void (async () => {
+			try {
+				const result = await materializeRecurrencesForRange({
+					app: this.app,
+					plannerFiles,
+					range,
+				});
+				if (result.created > 0 || result.updated > 0) this.render();
+			} finally {
+				if (this.materializeInFlightKey === key) {
+					this.materializeInFlightKey = null;
+				}
+			}
+		})();
+	}
+
+	private renderHeader(contentEl: HTMLElement): void {
+		const locale = this.plugin.settings.locale ?? "en";
+		const monthLabel = getMonthLabel(locale, this.month);
+		renderMonthlyPlannerHeader(
+			contentEl,
+			{
+				year: this.year,
+				month: this.month,
+				monthLabel,
+				app: this.app,
+			},
+			{
+				onPrev: () => {
+					if (this.month === 1) {
+						if (this.year > 1900) {
+							this.year--;
+							this.month = 12;
+						}
+					} else {
+						this.month--;
+					}
+					this.daySummaryOpen = false;
+					this.selectedDate = null;
+					this.render();
+				},
+				onNext: () => {
+					if (this.month === 12) {
+						if (this.year < 2100) {
+							this.year++;
+							this.month = 1;
+						}
+					} else {
+						this.month++;
+					}
+					this.daySummaryOpen = false;
+					this.selectedDate = null;
+					this.render();
+				},
+				onToday: () => {
+					const now = new Date();
+					this.year = now.getFullYear();
+					this.month = now.getMonth() + 1;
+					this.daySummaryOpen = false;
+					this.selectedDate = null;
+					this.render();
+				},
+				onMonthYearClick: (year, month) => {
+					this.year = year;
+					this.month = month;
+					this.daySummaryOpen = false;
+					this.selectedDate = null;
+					this.render();
+				},
+				onAddFile: () => {
+					this.openCreateFileModal(
+						getSelectionBounds(this.dragState),
+					);
+				},
+				onResetZoom:
+					Platform.isMobile
+						? () => {
+								this.pinchZoom?.resetScale();
+							}
+						: undefined,
+				onCyclePlannerView: () => {
+					void this.plugin.cyclePlannerView(this.leaf);
+				},
+			},
+		);
+	}
+
+	private renderTable(contentEl: HTMLElement): void {
+		const scrollContainer = contentEl.createDiv({
+			cls: "monthly-planner-scroll",
+		});
+		scrollContainer.addEventListener(
+			"click",
+			this.interactionHandler.handlePlannerClick.bind(
+				this.interactionHandler,
+			),
+			{ capture: true },
+		);
+		scrollContainer.addEventListener(
+			"mouseover",
+			this.interactionHandler.handleRangeBarMouseOver.bind(
+				this.interactionHandler,
+			),
+			{ capture: true },
+		);
+		scrollContainer.addEventListener(
+			"mouseout",
+			this.interactionHandler.handleRangeBarMouseOut.bind(
+				this.interactionHandler,
+			),
+			{ capture: true },
+		);
+		scrollContainer.addEventListener(
+			"touchend",
+			this.interactionHandler.handlePlannerTouchEnd.bind(
+				this.interactionHandler,
+			),
+			{ capture: true, passive: false },
+		);
+		scrollContainer.addEventListener(
+			"touchcancel",
+			this.interactionHandler.handlePlannerTouchCancel.bind(
+				this.interactionHandler,
+			),
+			{ capture: true },
+		);
+		scrollContainer.addEventListener(
+			"keydown",
+			this.interactionHandler.handlePlannerKeyDown.bind(
+				this.interactionHandler,
+			),
+			{ capture: true },
+		);
+
+		const tableParent = Platform.isMobile
+			? scrollContainer
+					.createDiv({ cls: "monthly-planner-zoom-wrapper" })
+					.createDiv({ cls: "monthly-planner-zoom-inner" })
+					.createDiv({ cls: "monthly-planner-table-wrapper" })
+			: scrollContainer.createDiv({
+					cls: "monthly-planner-table-wrapper",
+				});
+
+		const table = tableParent.createEl("table", {
+			cls: "monthly-planner-table",
+		});
+
+		const locale = this.plugin.settings.locale ?? "en";
+		const weekdayLabels = getWeekdayLabels(locale);
+
+		const thead = table.createEl("thead");
+		const headerRow = thead.createEl("tr");
+		for (const label of weekdayLabels) {
+			headerRow.createEl("th", { text: label });
+		}
+
+		const tbody = table.createEl("tbody");
+		const folder = this.plugin.settings.plannerFolder || "Planner";
+		const { showHolidays, holidayCountry } = this.plugin.settings;
+		const holidaysData =
+			showHolidays && holidayCountry
+				? getHolidaysForYear(holidayCountry, this.year)
+				: null;
+		const plannerFileScope = this.plugin.settings.plannerFileScope ?? "vault";
+		const plannerFiles = getPlannerMarkdownFiles(
+			this.app,
+			folder,
+			plannerFileScope,
+		);
+		this.queueMaterializeVisibleRecurrences(
+			{
+				start: `${this.year}-${String(this.month).padStart(2, "0")}-01`,
+				end: `${this.year}-${String(this.month).padStart(2, "0")}-${String(
+					getDaysInMonth(this.year, this.month),
+				).padStart(2, "0")}`,
+			},
+			plannerFiles,
+		);
+		const rangeLaneMap = getRangeLaneMap(
+			getRangesForYear(
+				this.app,
+				this.year,
+				folder,
+				plannerFileScope,
+				plannerFiles,
+			),
+		);
+		const cellCtx = {
+			app: this.app,
+			folder,
+			plannerFileScope,
+			plannerFiles,
+			dragState: this.dragState,
+			chipDragState: this.chipDragState,
+			clipboardSelection: this.clipboardSelection,
+			holidaysData,
+			alternateCalendarId: this.plugin.settings.alternateCalendarId ?? "",
+			locale,
+			rangeLaneMap,
+			selectedDate: this.daySummaryOpen ? this.selectedDate : null,
+			isCompactLayout: this.compactLayout,
+		};
+
+		const cells = getMonthCalendarCells(this.year, this.month);
+		let row: HTMLTableRowElement | null = null;
+		for (let i = 0; i < cells.length; i++) {
+			if (i % 7 === 0) {
+				row = tbody.createEl("tr");
+			}
+			const cellData = cells[i] ?? null;
+			const cell = createMonthlyCell(cellData, cellCtx);
+			row?.appendChild(cell);
+		}
+
+		scrollContainer.addEventListener(
+			"mousedown",
+			this.interactionHandler.handlePlannerMouseDown.bind(
+				this.interactionHandler,
+			),
+			{ capture: true },
+		);
+		scrollContainer.addEventListener(
+			"touchstart",
+			this.interactionHandler.handlePlannerTouchStart.bind(
+				this.interactionHandler,
+			),
+			{ capture: true, passive: false },
+		);
+	}
+
+	async openDateNote(
+		year: number,
+		month: number,
+		day: number,
+	): Promise<void> {
+		const folder = this.plugin.settings.plannerFolder || "Planner";
+		const leaf = this.plugin.getPlannerFileOpenLeaf(this.leaf);
+		await openDateNoteOp(this.app, leaf, folder, year, month, day);
+		if (leaf !== this.leaf) {
+			await this.app.workspace.revealLeaf(leaf);
+		}
+	}
+
+	openCreateFileModal(
+		bounds: import("../yearly-planner/types").SelectionBounds | null,
+	): void {
+		const defaultFolder = this.plugin.settings.plannerFolder || "Planner";
+		new CreateFileModal(this.app, {
+			bounds,
+			defaultFolder,
+			plannerFileScope: this.plugin.settings.plannerFileScope ?? "vault",
+			createSingleDateFile: (
+				folder,
+				basename,
+				color,
+				todo,
+				notifyMinutes,
+				recurrence,
+			) =>
+				createSingleDateFileOp(
+					this.app,
+					folder,
+					basename,
+					color,
+					todo,
+					notifyMinutes,
+					recurrence,
+				),
+			createRangeFile: (
+				folder,
+				basename,
+				color,
+				todo,
+				notifyMinutes,
+				recurrence,
+			) =>
+				createRangeFileOp(
+					this.app,
+					folder,
+					basename,
+					color,
+					todo,
+					notifyMinutes,
+					recurrence,
+				),
+			onCreated: () => this.render(),
+			openCreatedFile: (file) =>
+				this.plugin.openPlannerFile(this.leaf, file),
+		}).open();
+	}
+
+	openFileOptionsModal(file: TFile): void {
+		new FileOptionsModal(
+			this.app,
+			file,
+			this.leaf,
+			() => this.render(),
+			(openFile) => this.plugin.openPlannerFile(this.leaf, openFile),
+		).open();
+	}
+
+	openDaySummaryPanel(year: number, month: number, day: number): void {
+		this.selectedDate = { year, month, day };
+		this.daySummaryOpen = true;
+		this.render();
+	}
+
+	private closeDaySummaryPanel(): void {
+		this.daySummaryOpen = false;
+		this.render();
+	}
+
+	private renderMobileDaySummary(contentEl: HTMLElement): void {
+		if (!this.daySummaryOpen || !this.selectedDate) return;
+		const { year, month, day } = this.selectedDate;
+		const dateKey = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+		const alternateCalendarLabel = getAlternateCalendarLabel(
+			year,
+			month,
+			day,
+			this.plugin.settings.alternateCalendarId ?? "",
+			this.plugin.settings.locale ?? "en",
+		);
+		const sheet = contentEl.createDiv({
+			cls: "monthly-planner-day-summary-sheet",
+		});
+		const header = sheet.createDiv({
+			cls: "monthly-planner-day-summary-header",
+		});
+		const titleBlock = header.createDiv({
+			cls: "monthly-planner-day-summary-title-block",
+		});
+		titleBlock.createDiv({
+			cls: "monthly-planner-day-summary-title",
+			text: t("monthlyDaySheet.title", {
+				date: this.formatDaySummaryDate(year, month, day),
+			}),
+		});
+		if (alternateCalendarLabel) {
+			const labelsEl = titleBlock.createDiv({
+				cls: "monthly-planner-day-summary-alt-calendar-labels",
+			});
+			labelsEl.createSpan({
+				cls: "monthly-planner-day-summary-alt-calendar-label",
+				text: alternateCalendarLabel.text,
+			});
+		}
+		const closeBtn = header.createEl("button", {
+			cls: "monthly-planner-day-summary-close",
+			text: "×",
+		});
+		closeBtn.ariaLabel = t("monthlyDaySheet.close");
+		closeBtn.onclick = () => this.closeDaySummaryPanel();
+
+		const body = sheet.createDiv({
+			cls: "monthly-planner-day-summary-body",
+		});
+		const { singleFiles, rangeFiles } = getFilesForDate(
+			this.app,
+			this.plugin.settings.plannerFolder || "Planner",
+			year,
+			month,
+			day,
+			this.plugin.settings.plannerFileScope ?? "vault",
+		);
+		const { showHolidays, holidayCountry } = this.plugin.settings;
+		const holidayNames =
+			showHolidays && holidayCountry
+				? (getHolidaysForYear(holidayCountry, year).names.get(dateKey) ?? [])
+				: [];
+
+		for (const { file } of rangeFiles) {
+			this.createDaySummaryChip({
+				container: body,
+				text: this.getDisplayTitle(file),
+				color: getChipColor(this.app, file),
+				onClick: () => this.openFileOptionsModal(file),
+				extraClass: this.getRecurrenceChipClass(file),
+			});
+		}
+
+		for (const file of singleFiles) {
+			this.createDaySummaryChip({
+				container: body,
+				text: this.getDisplayTitle(file),
+				color: getChipColor(this.app, file),
+				onClick: () => this.openFileOptionsModal(file),
+				extraClass: this.getRecurrenceChipClass(file),
+			});
+		}
+
+		for (const holidayName of holidayNames) {
+			this.createDaySummaryChip({
+				container: body,
+				text: holidayName,
+				color: "var(--text-accent)",
+				onClick: undefined,
+				extraClass: "monthly-planner-day-summary-item-holiday",
+			});
+		}
+
+		if (
+			singleFiles.length === 0 &&
+			rangeFiles.length === 0 &&
+			holidayNames.length === 0
+		) {
+			body.createDiv({
+				cls: "monthly-planner-day-summary-empty",
+				text: t("monthlyDaySheet.empty"),
+			});
+		}
+
+		const footer = sheet.createDiv({
+			cls: "monthly-planner-day-summary-footer",
+		});
+		const createBtn = footer.createEl("button", {
+			cls: "mod-cta monthly-planner-day-summary-create",
+			text: t("monthlyDaySheet.create"),
+			type: "button",
+		});
+		createBtn.onclick = () =>
+			this.openCreateFileModal({
+				startYear: year,
+				startMonth: month,
+				startDay: day,
+				endYear: year,
+				endMonth: month,
+				endDay: day,
+			});
+	}
+
+	private shouldUseCompactLayout(): boolean {
+		if (Platform.isMobile) return true;
+		if (this.isInSidebar()) return true;
+		const width = this.getAvailableLayoutWidth();
+		if (width <= 0) return this.compactLayout;
+		return width <= MONTHLY_PLANNER_COMPACT_LAYOUT_MAX_WIDTH;
+	}
+
+	private isInSidebar(): boolean {
+		return Boolean(
+			this.contentEl.closest(".mod-left-split, .mod-right-split"),
+		);
+	}
+
+	private getAvailableLayoutWidth(): number {
+		const leafEl = this.contentEl.closest(".workspace-leaf");
+		const widths = [
+			this.contentEl.clientWidth,
+			this.contentEl.parentElement?.clientWidth ?? 0,
+			leafEl instanceof HTMLElement ? leafEl.clientWidth : 0,
+		];
+		return widths.find((width) => width > 0) ?? 0;
+	}
+
+	private attachResizeObserver(): void {
+		if (this.resizeObserver) return;
+		const ResizeObserverCtor =
+			this.contentEl.ownerDocument.defaultView?.ResizeObserver;
+		if (!ResizeObserverCtor) return;
+
+		this.resizeObserver = new ResizeObserverCtor(() => {
+			const nextCompactLayout = this.shouldUseCompactLayout();
+			if (nextCompactLayout === this.compactLayout) return;
+			this.compactLayout = nextCompactLayout;
+			if (!nextCompactLayout) {
+				this.daySummaryOpen = false;
+			}
+			this.render();
+		});
+		this.resizeObserver.observe(this.contentEl);
+		const leafEl = this.contentEl.closest(".workspace-leaf");
+		if (leafEl instanceof HTMLElement) {
+			this.resizeObserver.observe(leafEl);
+		}
+	}
+
+	private getDisplayTitle(file: TFile): string {
+		const title = getFileTitle(this.app, file);
+		if (isTodoCompleted(this.app, file)) {
+			return `${TODO_CHIP_EMOJI_COMPLETED} ${title}`;
+		}
+		if (isTodoFile(this.app, file)) {
+			return `${TODO_CHIP_EMOJI_INCOMPLETE} ${title}`;
+		}
+		return title;
+	}
+
+	private getRecurrenceChipClass(file: TFile): string | undefined {
+		if (isRecurrenceSourceFile(this.app, file)) return "planner-recurrence-source";
+		if (isRecurrenceOccurrenceFile(this.app, file)) {
+			return "planner-recurrence-occurrence";
+		}
+		return undefined;
+	}
+
+	private formatDaySummaryDate(year: number, month: number, day: number): string {
+		const locale = this.plugin.settings.locale ?? "en";
+		if (locale === "ko") {
+			return `${year}년 ${month}월 ${day}일`;
+		}
+		return `${month}/${day}/${year}`;
+	}
+
+	private createDaySummaryChip(opts: {
+		container: HTMLElement;
+		text: string;
+		color: string | null;
+		onClick?: (() => void) | undefined;
+		extraClass?: string;
+	}): void {
+		const item = opts.container.createEl("button", {
+			cls: [
+				"monthly-planner-day-summary-item",
+				"monthly-planner-cell-file",
+				opts.extraClass,
+			]
+				.filter(Boolean)
+				.join(" "),
+			type: "button",
+		});
+		item.textContent = opts.text;
+		if (opts.color) {
+			item.style.borderLeftColor = opts.color;
+		}
+		if (opts.onClick) {
+			item.onclick = opts.onClick;
+		}
+	}
+
+	private handleClipboardKeydown(e: KeyboardEvent): void {
+		if (!isPrimaryMod(e) || e.shiftKey) return;
+		if (shouldDeferPlannerClipboardToNative(e)) return;
+		if (this.app.workspace.getActiveViewOfType(MonthlyPlannerView) !== this)
+			return;
+
+		const k = e.key.toLowerCase();
+
+		if (k === "backspace" || k === "delete") {
+			if (this.clipboardSelection.size === 0) return;
+			e.preventDefault();
+			openPlannerClipboardSelectionTrashModal(
+				this.app,
+				resolveClipboardSelectionToFiles(
+					this.app,
+					this.plugin.settings.plannerFolder || "Planner",
+					this.plugin.settings.plannerFileScope ?? "vault",
+					this.clipboardSelection,
+				),
+				this.clipboardSelection,
+				() => this.render(),
+			);
+			return;
+		}
+
+		if (k === "z") {
+			if (this.pasteUndoBatches.length === 0) {
+				new Notice(t("plannerClipboard.undoNothing"));
+				e.preventDefault();
+				return;
+			}
+			e.preventDefault();
+			const batch = this.pasteUndoBatches.pop()!;
+			this.contentEl.addClass(PLANNER_CLIPBOARD_BUSY_CLASS);
+			void (async () => {
+				try {
+					const u = await undoPlannerPasteBatch(this.app, batch);
+					this.render();
+					if (!u.ok) {
+						this.pasteUndoBatches.push(batch);
+						new Notice(
+							t(u.errorKey, { path: u.path }),
+							PLANNER_CLIPBOARD_ERROR_NOTICE_MS,
+						);
+					} else if (u.trashedCount === 0) {
+						new Notice(
+							t("plannerClipboard.undoMissingFiles"),
+							PLANNER_CLIPBOARD_ERROR_NOTICE_MS,
+						);
+					} else {
+						new Notice(
+							t("plannerClipboard.undoSuccess", {
+								count: u.trashedCount,
+							}),
+							PLANNER_CLIPBOARD_SUCCESS_NOTICE_MS,
+						);
+					}
+				} finally {
+					this.contentEl.removeClass(PLANNER_CLIPBOARD_BUSY_CLASS);
+				}
+			})();
+			return;
+		}
+
+		if (k !== "c" && k !== "v") return;
+
+		if (k === "c") {
+			const files = resolveClipboardSelectionToFiles(
+				this.app,
+				this.plugin.settings.plannerFolder || "Planner",
+				this.plugin.settings.plannerFileScope ?? "vault",
+				this.clipboardSelection,
+			);
+			if (files.length === 0) {
+				new Notice(t("plannerClipboard.emptyCopy"));
+				e.preventDefault();
+				return;
+			}
+			e.preventDefault();
+			this.contentEl.addClass(PLANNER_CLIPBOARD_BUSY_CLASS);
+			void (async () => {
+				try {
+					const r = await copyPlannerSelectionToClipboard(
+						this.app,
+						files,
+					);
+					if (!r.ok) {
+						new Notice(
+							t(r.errorKey),
+							PLANNER_CLIPBOARD_ERROR_NOTICE_MS,
+						);
+					} else {
+						new Notice(
+							t("plannerClipboard.copySuccess", {
+								count: r.noteCount,
+							}),
+							PLANNER_CLIPBOARD_SUCCESS_NOTICE_MS,
+						);
+					}
+				} finally {
+					this.contentEl.removeClass(PLANNER_CLIPBOARD_BUSY_CLASS);
+				}
+			})();
+			return;
+		}
+
+		if (this.clipboardSelection.size === 0) return;
+		e.preventDefault();
+		this.contentEl.addClass(PLANNER_CLIPBOARD_BUSY_CLASS);
+		void (async () => {
+			try {
+				const r = await pastePlannerClipboard(
+					this.app,
+					this.plugin.settings.plannerFolder || "Planner",
+					this.clipboardSelection,
+				);
+				if (r.ok) {
+					this.pasteUndoBatches.push(r.createdPaths);
+					this.render();
+					new Notice(
+						t("plannerClipboard.pasteSuccess", {
+							count: r.fileCount,
+						}),
+						PLANNER_CLIPBOARD_SUCCESS_NOTICE_MS,
+					);
+				} else {
+					new Notice(t(r.errorKey), PLANNER_CLIPBOARD_ERROR_NOTICE_MS);
+				}
+			} catch {
+				new Notice(
+					t("plannerClipboard.pasteFailed"),
+					PLANNER_CLIPBOARD_ERROR_NOTICE_MS,
+				);
+			} finally {
+				this.contentEl.removeClass(PLANNER_CLIPBOARD_BUSY_CLASS);
+			}
+		})();
+	}
+}

@@ -1,0 +1,58 @@
+/** Get topmost planner-relevant element at coords; skips scroll/table wrappers. */
+export function getTopmostPlannerElementAt(
+	contentEl: HTMLElement,
+	clientX: number,
+	clientY: number,
+): Element | null {
+	const elements = contentEl.ownerDocument.elementsFromPoint(clientX, clientY);
+	for (const el of elements) {
+		if (!contentEl.contains(el as Node)) break;
+		const he = el as HTMLElement;
+		if (
+			he.closest?.(".yearly-planner-cell-file[data-path]") ||
+			he.closest?.(".yearly-planner-cell-range-bar[data-path]") ||
+			he.closest?.(".yearly-planner-cell-holiday-badge") ||
+			he.closest?.("td[data-year][data-month][data-day]")
+		) {
+			return el;
+		}
+	}
+	return null;
+}
+
+/** Get chip or range bar element at coords that has data-path (for chip drag). */
+export function getChipOrBarAt(
+	contentEl: HTMLElement,
+	clientX: number,
+	clientY: number,
+): HTMLElement | null {
+	const elements = contentEl.ownerDocument.elementsFromPoint(clientX, clientY);
+	for (const el of elements) {
+		if (!contentEl.contains(el as Node)) break;
+		const chip = (el as HTMLElement).closest?.(
+			".yearly-planner-cell-file[data-path], .yearly-planner-cell-range-bar[data-path]",
+		);
+		if (chip && (chip as HTMLElement).dataset.path) return chip as HTMLElement;
+	}
+	return null;
+}
+
+export function getCellAtClientPos(
+	contentEl: HTMLElement,
+	clientX: number,
+	clientY: number,
+): {
+	year: number;
+	month: number;
+	day: number;
+} | null {
+	const el = contentEl.ownerDocument.elementFromPoint(clientX, clientY);
+	const cell = el?.closest("td[data-year][data-month][data-day]");
+	if (!cell) return null;
+	const year = parseInt(cell.getAttribute("data-year") ?? "", 10);
+	const month = parseInt(cell.getAttribute("data-month") ?? "", 10);
+	const day = parseInt(cell.getAttribute("data-day") ?? "", 10);
+	if (isNaN(year) || isNaN(month) || isNaN(day)) return null;
+	if (cell.closest(".yearly-planner-cell-invalid")) return null;
+	return { year, month, day };
+}

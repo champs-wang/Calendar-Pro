@@ -1,0 +1,40 @@
+import type { TFile } from "obsidian";
+
+export interface YearlyPlannerState extends Record<string, unknown> {
+	year: number;
+	cellWidthExpanded?: boolean;
+	monthCellWidths?: Record<string, number>;
+}
+
+export interface DragState {
+	startYear: number;
+	startMonth: number;
+	startDay: number;
+	currentYear: number;
+	currentMonth: number;
+	currentDay: number;
+}
+
+export interface ChipDragState {
+	file: TFile;
+	startYear: number;
+	startMonth: number;
+	startDay: number;
+	currentYear: number;
+	currentMonth: number;
+	currentDay: number;
+}
+
+export interface RangeRunPosition {
+	runStart: boolean;
+	runEnd: boolean;
+}
+
+export interface SelectionBounds {
+	startYear: number;
+	startMonth: number;
+	startDay: number;
+	endYear: number;
+	endMonth: number;
+	endDay: number;
+}
