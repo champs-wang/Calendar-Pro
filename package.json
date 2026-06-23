@@ -1,7 +1,7 @@
 {
-	"name": "diary-obsidian",
-	"version": "1.3.6",
-	"description": "This is a diary obsidian plugin for Obsidian (https://obsidian.md)",
+	"name": "calendar-pro",
+	"version": "1.3.7",
+	"description": "Calendar Pro - Obsidian planner plugin with inline note content preview",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
